@@ -1,4 +1,4 @@
-"""Classify photos and live camera frames with the scenario 1a model."""
+"""Classify photos and live camera frames with the selected ONNX model."""
 
 from collections import deque
 from io import BytesIO
@@ -16,7 +16,30 @@ from scripts.https_camera import camera_event, decode_camera_frame
 from scripts.predict_lightweight import load_model, prepare_image
 
 
-MODEL_PATH = Path(__file__).resolve().parent / "artifacts/lightweight_fcm/mobilenet_fcm_knn_1a.onnx"
+MODEL_DIR = Path(__file__).resolve().parent / "artifacts/lightweight_fcm"
+MODEL_CHOICES = {
+    "FCM + KNN tanpa LDA": {
+        "file": "mobilenet_fcm_knn_1a.onnx",
+        "caption": "Skenario 1a · MobileNetV3-Small + PCA 50 + FCM + KNN",
+        "classifier": "KNN",
+        "fuzzy_by_class": False,
+        "fuzzy_caption": "FCM menghitung keanggotaan terhadap enam klaster menggunakan 50 komponen PCA.",
+    },
+    "LDA + FCM + KNN": {
+        "file": "mobilenet_lda5_fcm_knn.onnx",
+        "caption": "MobileNetV3-Small · PCA 50 dan LDA 5 + FCM · KNN",
+        "classifier": "KNN",
+        "fuzzy_by_class": False,
+        "fuzzy_caption": "FCM menghitung keanggotaan terhadap enam klaster menggunakan lima komponen LDA.",
+    },
+    "FCM + MLP 64": {
+        "file": "mobilenet_fcm_mlp64.onnx",
+        "caption": "MobileNetV3-Small + FCM + MLP 64 neuron",
+        "classifier": "MLP",
+        "fuzzy_by_class": True,
+        "fuzzy_caption": "Panel ini menampilkan keanggotaan FCM yang telah dikelompokkan menurut material.",
+    },
+}
 PREDICTIONS_PER_SECOND = 5
 NAMA = {
     "cardboard": "Kardus",
@@ -51,7 +74,7 @@ def review_photo(photo, model, config):
     return outputs[0].mean(axis=0), fuzzy
 
 
-def render_prediction(labels, scores, fuzzy, elapsed, rate=None, reviewed=False):
+def render_prediction(labels, scores, fuzzy, elapsed, rate=None, *, preset, reviewed=False):
     ranked = np.argsort(-scores, kind="stable")[:3]
     st.html(f'<p class="hasil-kelas">{NAMA[labels[ranked[0]]]}</p>')
     for i in ranked:
@@ -59,7 +82,7 @@ def render_prediction(labels, scores, fuzzy, elapsed, rate=None, reviewed=False)
     timing = f"Pemrosesan CPU {elapsed:.1f} ms"
     if rate is not None:
         timing += f" · {rate:.1f} prediksi/dtk"
-    st.caption(f"Skor KNN · {timing}")
+    st.caption(f"Skor {preset['classifier']} · {timing}")
 
     with st.expander("Lihat proses FCM"):
         if fuzzy is None:
@@ -68,19 +91,19 @@ def render_prediction(labels, scores, fuzzy, elapsed, rate=None, reviewed=False)
         if reviewed:
             st.write("Panel ini menampilkan rata-rata keanggotaan FCM dari empat orientasi foto.")
         else:
-            st.write(
-                "FCM menghitung keanggotaan gambar terhadap enam klaster. "
-                "KNN memakai 50 komponen PCA dan enam nilai keanggotaan untuk memperkirakan kelas sampah."
-            )
-        for cluster, score in enumerate(fuzzy, 1):
-            st.progress(float(score), text=f"Klaster {cluster} · {score:.1%}")
+            st.write(preset["fuzzy_caption"])
+        fuzzy_names = [NAMA[label] for label in labels] if preset["fuzzy_by_class"] else [
+            f"Klaster {index}" for index in range(1, len(fuzzy) + 1)
+        ]
+        for name, score in zip(fuzzy_names, fuzzy):
+            st.progress(float(score), text=f"{name} · {score:.1%}")
         st.caption(f"Total keanggotaan FCM {float(fuzzy.sum()):.0%}")
 
 
 class LivePrediction:
-    def __init__(self, model, config, labels, model_updated_ns):
+    def __init__(self, model, config, labels, model_revision):
         self.model, self.config, self.labels = model, config, labels
-        self.model_updated_ns = model_updated_ns
+        self.model_revision = model_revision
         self.lock = Lock()
         self.times = deque(maxlen=8)
         self.scores = None
@@ -103,7 +126,11 @@ class LivePrediction:
         return frame
 
     def update(self, photo, start, generation):
-        scores, fuzzy = predict(photo, self.model, self.config)
+        with self.lock:
+            if generation != self.generation:
+                return
+            model, config = self.model, self.config
+        scores, fuzzy = predict(photo, model, config)
         complete = perf_counter()
         with self.lock:
             if generation == self.generation:
@@ -133,22 +160,31 @@ class LivePrediction:
                 rate = (len(self.times) - 1) / (self.times[-1] - self.times[0])
             return self.scores, self.fuzzy, self.elapsed, rate
 
+    def set_model(self, model, config, labels, model_revision):
+        with self.lock:
+            self.model, self.config, self.labels = model, config, labels
+            self.model_revision = model_revision
+            self._reset_scores()
+
     def clear(self):
         with self.lock:
-            self.generation += 1
-            self.scores = None
-            self.fuzzy = None
-            self.next_frame = 0.0
-            self.times.clear()
+            self._reset_scores()
+
+    def _reset_scores(self):
+        self.generation += 1
+        self.scores = None
+        self.fuzzy = None
+        self.next_frame = 0.0
+        self.times.clear()
 
 
 @st.fragment(run_every=0.2)
-def render_live(stream):
+def render_live(stream, preset):
     current = stream.snapshot()
     if current is None:
         st.info("Menunggu gambar dari kamera.")
     else:
-        render_prediction(stream.labels, *current)
+        render_prediction(stream.labels, *current, preset=preset)
 
 
 st.set_page_config(page_title="Pilah Sampah", page_icon="♻️", layout="wide")
@@ -181,13 +217,16 @@ st.html("""
 
 st.title("Pilah sampah")
 st.write("Unggah foto atau arahkan kamera ke satu benda untuk melihat perkiraan jenis materialnya.")
-st.caption("Skenario 1a · MobileNetV3-Small + PCA 50 + FCM + KNN")
+selected_model = st.selectbox("Model", list(MODEL_CHOICES))
+preset = MODEL_CHOICES[selected_model]
+model_path = MODEL_DIR / preset["file"]
+st.caption(preset["caption"])
 
 photo_column, result_column = st.columns([1.15, 1], gap="medium")
 photo = None
 camera = None
 online_camera = False
-model_ready = MODEL_PATH.is_file()
+model_ready = model_path.is_file()
 with photo_column, st.container(key="photo_panel"):
     st.subheader("Foto atau kamera")
     source = st.segmented_control(
@@ -196,12 +235,16 @@ with photo_column, st.container(key="photo_panel"):
     )
     if source == "Kamera realtime":
         if model_ready:
-            model_updated_ns = MODEL_PATH.stat().st_mtime_ns
+            model_updated_ns = model_path.stat().st_mtime_ns
+            revision = (model_path, model_updated_ns)
             live = st.session_state.get("live_prediction")
-            if getattr(live, "model_updated_ns", None) != model_updated_ns or not hasattr(live, "receive_capture"):
-                model, config, labels = model_session(MODEL_PATH, model_updated_ns)
-                live = LivePrediction(model, config, labels, model_updated_ns)
+            if not hasattr(live, "set_model"):
+                model, config, labels = model_session(*revision)
+                live = LivePrediction(model, config, labels, revision)
                 st.session_state.live_prediction = live
+            elif live.model_revision != revision:
+                model, config, labels = model_session(*revision)
+                live.set_model(model, config, labels, revision)
             address = urlsplit(st.context.url or "")
             online_camera = address.scheme == "https" and address.hostname not in ("localhost", "127.0.0.1", "::1")
             if online_camera:
@@ -243,16 +286,16 @@ with photo_column, st.container(key="photo_panel"):
 with result_column, st.container(key="result_panel"):
     st.subheader("Hasil prediksi")
     if not model_ready:
-        st.error("Model ONNX skenario 1a belum tersedia. Ekspor model lalu muat ulang halaman ini.")
+        st.error(f"Model ONNX untuk {selected_model} belum tersedia.")
     elif online_camera:
         current = live.snapshot()
         if current is None:
             st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
         else:
-            render_prediction(live.labels, *current)
+            render_prediction(live.labels, *current, preset=preset)
     elif camera is not None:
         if camera.state.playing:
-            render_live(live)
+            render_live(live, preset)
         elif camera.state.signalling:
             st.info("Menghubungkan kamera.")
         else:
@@ -260,7 +303,7 @@ with result_column, st.container(key="result_panel"):
     elif photo is None:
         st.info("Hasil muncul setelah foto siap.")
     else:
-        model, config, labels = model_session(MODEL_PATH, MODEL_PATH.stat().st_mtime_ns)
+        model, config, labels = model_session(model_path, model_path.stat().st_mtime_ns)
         reviewed = st.toggle("Cek ulang foto sulit", help="Coba empat orientasi dengan foto sedikit lebih terang.")
         start = perf_counter()
         scores, fuzzy = predict(photo, model, config)
@@ -268,4 +311,4 @@ with result_column, st.container(key="result_panel"):
             first = int(scores.argmax())
             st.caption(f"Prediksi awal · {NAMA[labels[first]]} {scores[first]:.1%}")
             scores, fuzzy = review_photo(photo, model, config)
-        render_prediction(labels, scores, fuzzy, (perf_counter() - start) * 1000, reviewed=reviewed)
+        render_prediction(labels, scores, fuzzy, (perf_counter() - start) * 1000, preset=preset, reviewed=reviewed)
