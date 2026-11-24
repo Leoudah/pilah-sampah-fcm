@@ -7,6 +7,8 @@ Demo pembelajaran berbasis MobileNetV3-Small, FCM, dan MLP 64. Jalankan dengan P
 
 Untuk Streamlit Community Cloud, pilih streamlit_app.py sebagai entrypoint. Model ONNX ada di artifacts/lightweight_fcm.
 
+Pada URL HTTPS publik, **Kamera realtime** mengirim frame JPEG tanpa audio melalui koneksi Streamlit. Browser menunggu konfirmasi setiap frame, hingga 2,5 pengiriman per detik. Transport lokal menggunakan WebRTC.
+
 ## Sumber data model
 
 - [Garbage Dataset Classification · v5](https://www.kaggle.com/datasets/zlatan599/garbage-dataset-classification/versions/5)

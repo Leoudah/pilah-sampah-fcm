@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="id">
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; font: 15px system-ui, sans-serif; color: #17352b; }
+    video { display: block; width: 100%; max-height: 340px; border-radius: 12px; background: #172e25; }
+    video[hidden] { display: none; }
+    button {
+      margin: 8px 0; border: 0; border-radius: 7px; padding: 8px 14px;
+      color: #fff; background: #20694f; font: inherit; cursor: pointer;
+    }
+    button:focus-visible { outline: 2px solid #17352b; outline-offset: 3px; }
+    button:disabled { opacity: .6; cursor: default; }
+    #status { margin: 0 0 4px; }
+  </style>
+  <video id="preview" aria-label="Pratinjau kamera" muted playsinline autoplay hidden></video>
+  <button id="camera" type="button">Start</button>
+  <p id="status" role="status"></p>
+  <script>
+    const video = document.querySelector("#preview");
+    const button = document.querySelector("#camera");
+    const status = document.querySelector("#status");
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { alpha: false });
+    let stream = null;
+    let timer = null;
+    let pending = null;
+    let previousHeight = 0;
+    let closing = false;
+
+    function post(type, payload = {}) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...payload }, window.location.origin);
+    }
+
+    function send(value) {
+      pending = crypto.randomUUID();
+      post("streamlit:setComponentValue", { value: { ...value, id: pending }, dataType: "json" });
+    }
+
+    function size() {
+      const height = document.body.scrollHeight;
+      if (height !== previousHeight) {
+        previousHeight = height;
+        post("streamlit:setFrameHeight", { height });
+      }
+    }
+
+    function capture() {
+      if (!stream || pending || !video.videoWidth || video.paused) return;
+      const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      send({ kind: "frame", jpeg: canvas.toDataURL("image/jpeg", 0.72).split(",")[1] });
+    }
+
+    function stop(notify) {
+      clearInterval(timer);
+      timer = null;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      video.srcObject = null;
+      video.hidden = true;
+      button.textContent = "Start";
+      if (notify) send({ kind: "stop" });
+      size();
+    }
+
+    button.addEventListener("click", async () => {
+      if (stream) {
+        stop(true);
+        return;
+      }
+      button.disabled = true;
+      status.textContent = "";
+      try {
+        const source = await navigator.mediaDevices.getUserMedia({
+          audio: false, video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: { ideal: "environment" } }
+        });
+        if (closing) {
+          source.getTracks().forEach(track => track.stop());
+          return;
+        }
+        stream = source;
+        video.srcObject = stream;
+        video.hidden = false;
+        await video.play();
+        pending = null;
+        button.textContent = "Stop";
+        timer = setInterval(capture, 400);
+        capture();
+      } catch {
+        stop(false);
+        status.textContent = "Kamera belum bisa dibuka. Periksa izin kamera di browser.";
+      } finally {
+        button.disabled = false;
+        size();
+      }
+    });
+
+    window.addEventListener("message", event => {
+      if (event.source !== window.parent || event.origin !== window.location.origin) return;
+      if (event.data?.type === "streamlit:render") {
+        if (event.data.args?.ack === pending) pending = null;
+        size();
+      }
+    });
+    window.addEventListener("pagehide", () => {
+      closing = true;
+      stop(false);
+    });
+    new ResizeObserver(size).observe(document.body);
+    post("streamlit:componentReady", { apiVersion: 1 });
+    size();
+  </script>
+</html>

@@ -5,12 +5,14 @@ from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
+from urllib.parse import urlsplit
 
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageOps
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
+from scripts.https_camera import camera_event, decode_camera_frame
 from scripts.predict_lightweight import load_model, prepare_image
 
 
@@ -86,6 +88,7 @@ class LivePrediction:
         self.elapsed = 0.0
         self.next_frame = 0.0
         self.generation = 0
+        self.last_capture = None
 
     def receive(self, frame):
         start = perf_counter()
@@ -96,6 +99,10 @@ class LivePrediction:
             generation = self.generation
 
         photo = Image.fromarray(frame.to_ndarray(format="rgb24"))
+        self.update(photo, start, generation)
+        return frame
+
+    def update(self, photo, start, generation):
         scores, fuzzy = predict(photo, self.model, self.config)
         complete = perf_counter()
         with self.lock:
@@ -104,7 +111,18 @@ class LivePrediction:
                 self.fuzzy = fuzzy
                 self.elapsed = (complete - start) * 1000
                 self.times.append(start)
-        return frame
+
+    def receive_capture(self, event):
+        capture = event.get("id")
+        if not isinstance(capture, str) or capture == self.last_capture:
+            return
+        self.last_capture = capture
+        if event.get("kind") == "stop":
+            self.clear()
+        elif event.get("kind") == "frame":
+            photo = decode_camera_frame(event.get("jpeg"))
+            if photo is not None:
+                self.update(photo, perf_counter(), self.generation)
 
     def snapshot(self):
         with self.lock:
@@ -168,6 +186,7 @@ st.caption("MobileNetV3-Small · Fuzzy C-Means · MLP 64")
 photo_column, result_column = st.columns([1.15, 1], gap="medium")
 photo = None
 camera = None
+online_camera = False
 model_ready = MODEL_PATH.is_file()
 with photo_column, st.container(key="photo_panel"):
     st.subheader("Foto atau kamera")
@@ -179,25 +198,30 @@ with photo_column, st.container(key="photo_panel"):
         if model_ready:
             model_updated_ns = MODEL_PATH.stat().st_mtime_ns
             live = st.session_state.get("live_prediction")
-            if getattr(live, "model_updated_ns", None) != model_updated_ns:
+            if getattr(live, "model_updated_ns", None) != model_updated_ns or not hasattr(live, "receive_capture"):
                 model, config, labels = model_session(MODEL_PATH, model_updated_ns)
                 live = LivePrediction(model, config, labels, model_updated_ns)
                 st.session_state.live_prediction = live
-            camera = webrtc_streamer(
-                key="kamera-realtime",
-                mode=WebRtcMode.SENDRECV,
-                rtc_configuration={"iceServers": []},
-                media_stream_constraints={
-                    "audio": False,
-                    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 20}},
-                },
-                video_frame_callback=live.receive,
-                on_video_ended=live.clear,
-                video_html_attrs={
-                    "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
-                    "style": {"width": "100%", "maxHeight": "340px", "borderRadius": "12px"},
-                },
-            )
+            address = urlsplit(st.context.url or "")
+            online_camera = address.scheme == "https" and address.hostname not in ("localhost", "127.0.0.1", "::1")
+            if online_camera:
+                live.receive_capture(camera_event())
+            else:
+                camera = webrtc_streamer(
+                    key="kamera-realtime",
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration={"iceServers": []},
+                    media_stream_constraints={
+                        "audio": False,
+                        "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 20}},
+                    },
+                    video_frame_callback=live.receive,
+                    on_video_ended=live.clear,
+                    video_html_attrs={
+                        "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
+                        "style": {"width": "100%", "maxHeight": "340px", "borderRadius": "12px"},
+                    },
+                )
             st.caption("Letakkan satu benda di tengah. Untuk botol, beri jarak dari tepi agar leher dan dasar terlihat utuh.")
     else:
         st.session_state.pop("live_prediction", None)
@@ -220,6 +244,12 @@ with result_column, st.container(key="result_panel"):
     st.subheader("Hasil prediksi")
     if not model_ready:
         st.error("Model ONNX belum tersedia. Jalankan sel terakhir notebook 08, lalu muat ulang halaman ini.")
+    elif online_camera:
+        current = live.snapshot()
+        if current is None:
+            st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
+        else:
+            render_prediction(live.labels, *current)
     elif camera is not None:
         if camera.state.playing:
             render_live(live)
