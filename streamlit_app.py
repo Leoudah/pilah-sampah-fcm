@@ -1,4 +1,4 @@
-"""Classify photos and live camera frames with the model from notebook 08."""
+"""Classify photos and live camera frames with the scenario 1a model."""
 
 from collections import deque
 from io import BytesIO
@@ -16,7 +16,7 @@ from scripts.https_camera import camera_event, decode_camera_frame
 from scripts.predict_lightweight import load_model, prepare_image
 
 
-MODEL_PATH = Path(__file__).resolve().parent / "artifacts/lightweight_fcm/mobilenet_fcm_mlp64.onnx"
+MODEL_PATH = Path(__file__).resolve().parent / "artifacts/lightweight_fcm/mobilenet_fcm_knn_1a.onnx"
 PREDICTIONS_PER_SECOND = 5
 NAMA = {
     "cardboard": "Kardus",
@@ -52,28 +52,28 @@ def review_photo(photo, model, config):
 
 
 def render_prediction(labels, scores, fuzzy, elapsed, rate=None, reviewed=False):
-    ranked = scores.argsort()[::-1][:3]
+    ranked = np.argsort(-scores, kind="stable")[:3]
     st.html(f'<p class="hasil-kelas">{NAMA[labels[ranked[0]]]}</p>')
     for i in ranked:
         st.progress(float(scores[i]), text=f"{NAMA[labels[i]]} · {scores[i]:.1%}")
     timing = f"Pemrosesan CPU {elapsed:.1f} ms"
     if rate is not None:
         timing += f" · {rate:.1f} prediksi/dtk"
-    st.caption(f"Skor model · {timing}")
+    st.caption(f"Skor KNN · {timing}")
 
     with st.expander("Lihat proses FCM"):
         if fuzzy is None:
-            st.info("Ekspor ulang model dari Notebook 08 untuk menampilkan skor FCM.")
+            st.info("Keluaran keanggotaan belum tersedia pada model ini.")
             return
         if reviewed:
             st.write("Panel ini menampilkan rata-rata keanggotaan FCM dari empat orientasi foto.")
         else:
             st.write(
-                "FCM membandingkan gambar terakhir dengan 24 prototipe hasil pelatihan. "
-                "Empat keanggotaan prototipe dijumlahkan untuk setiap kelas, lalu enam skor ini masuk ke MLP bersama fitur MobileNet."
+                "FCM menghitung keanggotaan gambar terhadap enam klaster. "
+                "KNN memakai 50 komponen PCA dan enam nilai keanggotaan untuk memperkirakan kelas sampah."
             )
-        for label, score in zip(labels, fuzzy):
-            st.progress(float(score), text=f"FCM · {NAMA[label]} · {score:.1%}")
+        for cluster, score in enumerate(fuzzy, 1):
+            st.progress(float(score), text=f"Klaster {cluster} · {score:.1%}")
         st.caption(f"Total keanggotaan FCM {float(fuzzy.sum()):.0%}")
 
 
@@ -181,7 +181,7 @@ st.html("""
 
 st.title("Pilah sampah")
 st.write("Unggah foto atau arahkan kamera ke satu benda untuk melihat perkiraan jenis materialnya.")
-st.caption("MobileNetV3-Small · Fuzzy C-Means · MLP 64")
+st.caption("Skenario 1a · MobileNetV3-Small + PCA 50 + FCM + KNN")
 
 photo_column, result_column = st.columns([1.15, 1], gap="medium")
 photo = None
@@ -243,7 +243,7 @@ with photo_column, st.container(key="photo_panel"):
 with result_column, st.container(key="result_panel"):
     st.subheader("Hasil prediksi")
     if not model_ready:
-        st.error("Model ONNX belum tersedia. Jalankan sel terakhir notebook 08, lalu muat ulang halaman ini.")
+        st.error("Model ONNX skenario 1a belum tersedia. Ekspor model lalu muat ulang halaman ini.")
     elif online_camera:
         current = live.snapshot()
         if current is None:
