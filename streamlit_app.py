@@ -1,0 +1,241 @@
+"""Classify photos and live camera frames with the model from notebook 08."""
+
+from collections import deque
+from io import BytesIO
+from pathlib import Path
+from threading import Lock
+from time import perf_counter
+
+import numpy as np
+import streamlit as st
+from PIL import Image, ImageEnhance, ImageOps
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
+
+from scripts.predict_lightweight import load_model, prepare_image
+
+
+MODEL_PATH = Path(__file__).resolve().parent / "artifacts/lightweight_fcm/mobilenet_fcm_mlp64.onnx"
+PREDICTIONS_PER_SECOND = 5
+NAMA = {
+    "cardboard": "Kardus",
+    "glass": "Kaca",
+    "metal": "Logam",
+    "paper": "Kertas",
+    "plastic": "Plastik",
+    "trash": "Sampah lainnya",
+}
+
+
+@st.cache_resource(show_spinner=False)
+def model_session(path, modified_ns):
+    return load_model(path)
+
+
+def predict(photo, model, config):
+    tensor = prepare_image(photo, config)
+    outputs = model.run(None, {model.get_inputs()[0].name: tensor})
+    fuzzy = outputs[1][0] if len(outputs) > 1 else None
+    return outputs[0][0], fuzzy
+
+
+def review_photo(photo, model, config):
+    bright = ImageEnhance.Brightness(photo).enhance(1.25)
+    rotated = [bright, *(bright.transpose(angle) for angle in (
+        Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270,
+    ))]
+    batch = np.concatenate([prepare_image(view, config) for view in rotated])
+    outputs = model.run(None, {model.get_inputs()[0].name: batch})
+    fuzzy = outputs[1].mean(axis=0) if len(outputs) > 1 else None
+    return outputs[0].mean(axis=0), fuzzy
+
+
+def render_prediction(labels, scores, fuzzy, elapsed, rate=None, reviewed=False):
+    ranked = scores.argsort()[::-1][:3]
+    st.html(f'<p class="hasil-kelas">{NAMA[labels[ranked[0]]]}</p>')
+    for i in ranked:
+        st.progress(float(scores[i]), text=f"{NAMA[labels[i]]} · {scores[i]:.1%}")
+    timing = f"Pemrosesan CPU {elapsed:.1f} ms"
+    if rate is not None:
+        timing += f" · {rate:.1f} prediksi/dtk"
+    st.caption(f"Skor model · {timing}")
+
+    with st.expander("Lihat proses FCM"):
+        if fuzzy is None:
+            st.info("Ekspor ulang model dari Notebook 08 untuk menampilkan skor FCM.")
+            return
+        if reviewed:
+            st.write("Panel ini menampilkan rata-rata keanggotaan FCM dari empat orientasi foto.")
+        else:
+            st.write(
+                "FCM membandingkan gambar terakhir dengan 24 prototipe hasil pelatihan. "
+                "Empat keanggotaan prototipe dijumlahkan untuk setiap kelas, lalu enam skor ini masuk ke MLP bersama fitur MobileNet."
+            )
+        for label, score in zip(labels, fuzzy):
+            st.progress(float(score), text=f"FCM · {NAMA[label]} · {score:.1%}")
+        st.caption(f"Total keanggotaan FCM {float(fuzzy.sum()):.0%}")
+
+
+class LivePrediction:
+    def __init__(self, model, config, labels, model_updated_ns):
+        self.model, self.config, self.labels = model, config, labels
+        self.model_updated_ns = model_updated_ns
+        self.lock = Lock()
+        self.times = deque(maxlen=8)
+        self.scores = None
+        self.fuzzy = None
+        self.elapsed = 0.0
+        self.next_frame = 0.0
+        self.generation = 0
+
+    def receive(self, frame):
+        start = perf_counter()
+        with self.lock:
+            if start < self.next_frame:
+                return frame
+            self.next_frame = start + 1 / PREDICTIONS_PER_SECOND
+            generation = self.generation
+
+        photo = Image.fromarray(frame.to_ndarray(format="rgb24"))
+        scores, fuzzy = predict(photo, self.model, self.config)
+        complete = perf_counter()
+        with self.lock:
+            if generation == self.generation:
+                self.scores = scores if self.scores is None else 0.6 * scores + 0.4 * self.scores
+                self.fuzzy = fuzzy
+                self.elapsed = (complete - start) * 1000
+                self.times.append(start)
+        return frame
+
+    def snapshot(self):
+        with self.lock:
+            if not self.times or perf_counter() - self.times[-1] > 1.5:
+                return None
+            rate = None
+            if len(self.times) > 1:
+                rate = (len(self.times) - 1) / (self.times[-1] - self.times[0])
+            return self.scores, self.fuzzy, self.elapsed, rate
+
+    def clear(self):
+        with self.lock:
+            self.generation += 1
+            self.scores = None
+            self.fuzzy = None
+            self.next_frame = 0.0
+            self.times.clear()
+
+
+@st.fragment(run_every=0.2)
+def render_live(stream):
+    current = stream.snapshot()
+    if current is None:
+        st.info("Menunggu gambar dari kamera.")
+    else:
+        render_prediction(stream.labels, *current)
+
+
+st.set_page_config(page_title="Pilah Sampah", page_icon="♻️", layout="wide")
+st.html("""
+<style>
+  .stMainBlockContainer {max-width: 1100px; padding-top: 4rem;}
+  .st-key-photo_panel, .st-key-result_panel {
+    background: white;
+    border: 1px solid #d8e5dd;
+    border-radius: 18px;
+    padding: 1.25rem;
+  }
+  .st-key-photo_panel [data-testid="stImage"] img {
+    border-radius: 12px;
+  }
+  .hasil-kelas {
+    margin: .1rem 0 .45rem;
+    color: #1b5e47;
+    font-size: clamp(1.8rem, 5vw, 2.5rem);
+    line-height: 1.15;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+  }
+  @media (max-width: 600px) {
+    .stMainBlockContainer {padding-top: 3rem;}
+    .st-key-photo_panel, .st-key-result_panel {padding: 1rem;}
+  }
+</style>
+""")
+
+st.title("Pilah sampah")
+st.write("Unggah foto atau arahkan kamera ke satu benda untuk melihat perkiraan jenis materialnya.")
+st.caption("MobileNetV3-Small · Fuzzy C-Means · MLP 64")
+
+photo_column, result_column = st.columns([1.15, 1], gap="medium")
+photo = None
+camera = None
+model_ready = MODEL_PATH.is_file()
+with photo_column, st.container(key="photo_panel"):
+    st.subheader("Foto atau kamera")
+    source = st.segmented_control(
+        "Sumber gambar", ["Unggah foto", "Ambil foto", "Kamera realtime"],
+        default="Unggah foto", required=True,
+    )
+    if source == "Kamera realtime":
+        if model_ready:
+            model_updated_ns = MODEL_PATH.stat().st_mtime_ns
+            live = st.session_state.get("live_prediction")
+            if getattr(live, "model_updated_ns", None) != model_updated_ns:
+                model, config, labels = model_session(MODEL_PATH, model_updated_ns)
+                live = LivePrediction(model, config, labels, model_updated_ns)
+                st.session_state.live_prediction = live
+            camera = webrtc_streamer(
+                key="kamera-realtime",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration={"iceServers": []},
+                media_stream_constraints={
+                    "audio": False,
+                    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 20}},
+                },
+                video_frame_callback=live.receive,
+                on_video_ended=live.clear,
+                video_html_attrs={
+                    "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
+                    "style": {"width": "100%", "maxHeight": "340px", "borderRadius": "12px"},
+                },
+            )
+            st.caption("Letakkan satu benda di tengah. Untuk botol, beri jarak dari tepi agar leher dan dasar terlihat utuh.")
+    else:
+        st.session_state.pop("live_prediction", None)
+        if source == "Ambil foto":
+            incoming = st.camera_input("Ambil foto")
+        else:
+            incoming = st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png", "webp"])
+        if incoming is not None:
+            try:
+                with Image.open(BytesIO(incoming.getvalue())) as original:
+                    photo = ImageOps.exif_transpose(original).convert("RGB")
+            except (OSError, ValueError, Image.DecompressionBombError):
+                st.error("Foto tidak bisa dibaca. Coba file JPG, PNG, atau WebP yang bisa dibuka.")
+            else:
+                preview = photo.copy()
+                preview.thumbnail((640, 340))
+                st.image(preview, caption=incoming.name)
+
+with result_column, st.container(key="result_panel"):
+    st.subheader("Hasil prediksi")
+    if not model_ready:
+        st.error("Model ONNX belum tersedia. Jalankan sel terakhir notebook 08, lalu muat ulang halaman ini.")
+    elif camera is not None:
+        if camera.state.playing:
+            render_live(live)
+        elif camera.state.signalling:
+            st.info("Menghubungkan kamera.")
+        else:
+            st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
+    elif photo is None:
+        st.info("Hasil muncul setelah foto siap.")
+    else:
+        model, config, labels = model_session(MODEL_PATH, MODEL_PATH.stat().st_mtime_ns)
+        reviewed = st.toggle("Cek ulang foto sulit", help="Coba empat orientasi dengan foto sedikit lebih terang.")
+        start = perf_counter()
+        scores, fuzzy = predict(photo, model, config)
+        if reviewed:
+            first = int(scores.argmax())
+            st.caption(f"Prediksi awal · {NAMA[labels[first]]} {scores[first]:.1%}")
+            scores, fuzzy = review_photo(photo, model, config)
+        render_prediction(labels, scores, fuzzy, (perf_counter() - start) * 1000, reviewed=reviewed)
