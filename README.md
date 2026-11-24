@@ -15,6 +15,21 @@ Untuk Streamlit Community Cloud, pilih `streamlit_app.py` sebagai entrypoint. Ke
 
 Model LDA menerima fitur MobileNet langsung pada cabang FCM. KNN menggabungkan enam keanggotaan tersebut dengan 50 komponen PCA dari cabang lainnya. Hasil verifikasi ONNX pada 1.200 foto uji cocok dengan notebook, yaitu 1.027 prediksi benar (85,58%).
 
+## Material dominan per klaster LDA–FCM
+
+Setiap citra latih dikelompokkan menurut klaster dengan derajat keanggotaan tertinggi. Material dominan adalah label yang paling sering muncul di klaster tersebut.
+
+| Klaster | Material dominan | Jumlah citra material tersebut / total klaster |
+| --- | --- | ---: |
+| 1 | Kaca | 715 / 753 |
+| 2 | Kardus | 757 / 866 |
+| 3 | Logam | 755 / 844 |
+| 4 | Kertas | 709 / 759 |
+| 5 | Sampah lainnya | 736 / 752 |
+| 6 | Plastik | 705 / 826 |
+
+Di panel **Lihat proses FCM**, angka pada bar menunjukkan keanggotaan foto yang sedang diproses. KNN menentukan label prediksi. Pada model PCA tanpa LDA, keenam nilai keanggotaan cenderung hampir merata sehingga panel menampilkan nomor klaster. Model MLP tetap menampilkan keanggotaan yang dikelompokkan menurut material.
+
 Pada URL HTTPS publik, **Kamera realtime** mengirim frame JPEG tanpa audio melalui koneksi Streamlit. Browser menunggu konfirmasi setiap frame, hingga 2,5 pengiriman per detik. Transport lokal menggunakan WebRTC.
 
 ## Ringkasan skenario 1a

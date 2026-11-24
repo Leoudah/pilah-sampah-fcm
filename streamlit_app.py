@@ -30,6 +30,15 @@ MODEL_CHOICES = {
         "caption": "MobileNetV3-Small · PCA 50 dan LDA 5 + FCM · KNN",
         "classifier": "KNN",
         "fuzzy_by_class": False,
+        # Material dominan dan jumlah citra pada klaster terkuat di data latih.
+        "cluster_profiles": (
+            ("glass", 715, 753),
+            ("cardboard", 757, 866),
+            ("metal", 755, 844),
+            ("paper", 709, 759),
+            ("trash", 736, 752),
+            ("plastic", 705, 826),
+        ),
         "fuzzy_caption": "FCM menghitung keanggotaan terhadap enam klaster menggunakan lima komponen LDA.",
     },
     "FCM + MLP 64": {
@@ -92,9 +101,24 @@ def render_prediction(labels, scores, fuzzy, elapsed, rate=None, *, preset, revi
             st.write("Panel ini menampilkan rata-rata keanggotaan FCM dari empat orientasi foto.")
         else:
             st.write(preset["fuzzy_caption"])
-        fuzzy_names = [NAMA[label] for label in labels] if preset["fuzzy_by_class"] else [
-            f"Klaster {index}" for index in range(1, len(fuzzy) + 1)
-        ]
+        profiles = preset.get("cluster_profiles")
+        if preset["fuzzy_by_class"]:
+            fuzzy_names = [NAMA[label] for label in labels]
+        elif profiles and len(profiles) == len(fuzzy):
+            fuzzy_names = [
+                f"Klaster {index} · dominan {NAMA[material]} ({count}/{total} citra latih klaster)"
+                for index, (material, count, total) in enumerate(profiles, 1)
+            ]
+            st.caption(
+                "Material dominan dihitung dari label citra latih pada klaster terkuatnya. "
+                "Persentase pada tiap bar menunjukkan keanggotaan foto saat ini. Kelas prediksi ditentukan KNN."
+            )
+        else:
+            fuzzy_names = [f"Klaster {index}" for index in range(1, len(fuzzy) + 1)]
+            st.caption(
+                "Pada model PCA, keanggotaan keenam klaster hampir merata. "
+                "Pilih LDA + FCM + KNN untuk melihat material dominan tiap klaster."
+            )
         for name, score in zip(fuzzy_names, fuzzy):
             st.progress(float(score), text=f"{name} · {score:.1%}")
         st.caption(f"Total keanggotaan FCM {float(fuzzy.sum()):.0%}")
