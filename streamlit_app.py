@@ -1,6 +1,7 @@
 """Classify photos and live camera frames with the selected ONNX model."""
 
 from collections import deque
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
@@ -13,6 +14,7 @@ from PIL import Image, ImageEnhance, ImageOps
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from scripts.https_camera import camera_event, decode_camera_frame
+from scripts.model_description import render_description
 from scripts.predict_lightweight import load_model, prepare_image
 
 
@@ -214,7 +216,7 @@ def render_live(stream, preset):
 st.set_page_config(page_title="Pilah Sampah", page_icon="♻️", layout="wide")
 st.html("""
 <style>
-  .stMainBlockContainer {max-width: 1100px; padding-top: 4rem;}
+  .stMainBlockContainer {max-width: 1100px; padding-top: 2.5rem;}
   .st-key-photo_panel, .st-key-result_panel {
     background: white;
     border: 1px solid #d8e5dd;
@@ -233,106 +235,137 @@ st.html("""
     overflow-wrap: anywhere;
   }
   @media (max-width: 600px) {
-    .stMainBlockContainer {padding-top: 3rem;}
+    .stMainBlockContainer {padding-top: 1.5rem;}
     .st-key-photo_panel, .st-key-result_panel {padding: 1rem;}
   }
 </style>
 """)
 
-st.title("Pilah sampah")
-st.write("Unggah foto atau arahkan kamera ke satu benda untuk melihat perkiraan jenis materialnya.")
-selected_model = st.selectbox("Model", list(MODEL_CHOICES))
-preset = MODEL_CHOICES[selected_model]
-model_path = MODEL_DIR / preset["file"]
-st.caption(preset["caption"])
+def render_prediction_page():
+    st.title("Pilah sampah")
+    st.write("Unggah foto atau arahkan kamera ke satu benda untuk melihat perkiraan jenis materialnya.")
+    selected_model = st.selectbox("Model", list(MODEL_CHOICES))
+    preset = MODEL_CHOICES[selected_model]
+    model_path = MODEL_DIR / preset["file"]
+    st.caption(preset["caption"])
 
-photo_column, result_column = st.columns([1.15, 1], gap="medium")
-photo = None
-camera = None
-online_camera = False
-model_ready = model_path.is_file()
-with photo_column, st.container(key="photo_panel"):
-    st.subheader("Foto atau kamera")
-    source = st.segmented_control(
-        "Sumber gambar", ["Unggah foto", "Ambil foto", "Kamera realtime"],
-        default="Unggah foto", required=True,
-    )
-    if source == "Kamera realtime":
-        if model_ready:
-            model_updated_ns = model_path.stat().st_mtime_ns
-            revision = (model_path, model_updated_ns)
-            live = st.session_state.get("live_prediction")
-            if not hasattr(live, "set_model"):
-                model, config, labels = model_session(*revision)
-                live = LivePrediction(model, config, labels, revision)
-                st.session_state.live_prediction = live
-            elif live.model_revision != revision:
-                model, config, labels = model_session(*revision)
-                live.set_model(model, config, labels, revision)
-            address = urlsplit(st.context.url or "")
-            online_camera = address.scheme == "https" and address.hostname not in ("localhost", "127.0.0.1", "::1")
-            if online_camera:
-                live.receive_capture(camera_event())
+    photo_column, result_column = st.columns([1.15, 1], gap="medium")
+    photo = None
+    photo_hash = None
+    camera = None
+    online_camera = False
+    model_ready = model_path.is_file()
+    with photo_column, st.container(key="photo_panel"):
+        st.subheader("Foto atau kamera")
+        source = st.segmented_control(
+            "Sumber gambar", ["Unggah foto", "Ambil foto", "Kamera realtime"],
+            default="Unggah foto", required=True,
+        )
+        if source == "Kamera realtime":
+            if model_ready:
+                model_updated_ns = model_path.stat().st_mtime_ns
+                revision = (model_path, model_updated_ns)
+                live = st.session_state.get("live_prediction")
+                if not hasattr(live, "set_model"):
+                    model, config, labels = model_session(*revision)
+                    live = LivePrediction(model, config, labels, revision)
+                    st.session_state.live_prediction = live
+                elif live.model_revision != revision:
+                    model, config, labels = model_session(*revision)
+                    live.set_model(model, config, labels, revision)
+                address = urlsplit(st.context.url or "")
+                online_camera = address.scheme == "https" and address.hostname not in ("localhost", "127.0.0.1", "::1")
+                if online_camera:
+                    live.receive_capture(camera_event())
+                else:
+                    camera = webrtc_streamer(
+                        key="kamera-realtime",
+                        mode=WebRtcMode.SENDRECV,
+                        rtc_configuration={"iceServers": []},
+                        media_stream_constraints={
+                            "audio": False,
+                            "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 20}},
+                        },
+                        video_frame_callback=live.receive,
+                        on_video_ended=live.clear,
+                        video_html_attrs={
+                            "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
+                            "style": {"width": "100%", "maxHeight": "340px", "borderRadius": "12px"},
+                        },
+                    )
+                st.caption("Letakkan satu benda di tengah. Untuk botol, beri jarak dari tepi agar leher dan dasar terlihat utuh.")
+        else:
+            st.session_state.pop("live_prediction", None)
+            if source == "Ambil foto":
+                incoming = st.camera_input("Ambil foto")
             else:
-                camera = webrtc_streamer(
-                    key="kamera-realtime",
-                    mode=WebRtcMode.SENDRECV,
-                    rtc_configuration={"iceServers": []},
-                    media_stream_constraints={
-                        "audio": False,
-                        "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 20}},
-                    },
-                    video_frame_callback=live.receive,
-                    on_video_ended=live.clear,
-                    video_html_attrs={
-                        "autoPlay": True, "controls": False, "muted": True, "playsInline": True,
-                        "style": {"width": "100%", "maxHeight": "340px", "borderRadius": "12px"},
-                    },
+                incoming = st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png", "webp"])
+            if incoming is not None:
+                try:
+                    contents = incoming.getvalue()
+                    with Image.open(BytesIO(contents)) as original:
+                        photo = ImageOps.exif_transpose(original).convert("RGB")
+                except (OSError, ValueError, Image.DecompressionBombError):
+                    st.error("Foto tidak bisa dibaca. Coba file JPG, PNG, atau WebP yang bisa dibuka.")
+                else:
+                    photo_hash = sha256(contents).hexdigest()
+                    preview = photo.copy()
+                    preview.thumbnail((640, 340))
+                    st.image(preview, caption=incoming.name)
+
+    with result_column, st.container(key="result_panel"):
+        st.subheader("Hasil prediksi")
+        if not model_ready:
+            st.error(f"Model ONNX untuk {selected_model} belum tersedia.")
+        elif online_camera:
+            current = live.snapshot()
+            if current is None:
+                st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
+            else:
+                render_prediction(live.labels, *current, preset=preset)
+        elif camera is not None:
+            if camera.state.playing:
+                render_live(live, preset)
+            elif camera.state.signalling:
+                st.info("Menghubungkan kamera.")
+            else:
+                st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
+        elif photo is None:
+            st.session_state.pop("photo_prediction", None)
+            st.info("Siapkan foto, lalu tekan Jalankan prediksi.")
+        else:
+            reviewed = st.toggle("Cek ulang foto sulit", help="Coba empat orientasi dengan foto sedikit lebih terang.")
+            revision = (model_path, model_path.stat().st_mtime_ns)
+            prediction_key = (revision, photo_hash, reviewed)
+            if st.button("Jalankan prediksi", type="primary"):
+                model, config, labels = model_session(*revision)
+                start = perf_counter()
+                scores, fuzzy = predict(photo, model, config)
+                first = None
+                if reviewed:
+                    index = int(scores.argmax())
+                    first = (labels[index], scores[index])
+                    scores, fuzzy = review_photo(photo, model, config)
+                st.session_state.photo_prediction = (
+                    prediction_key, labels, scores, fuzzy, (perf_counter() - start) * 1000, first,
                 )
-            st.caption("Letakkan satu benda di tengah. Untuk botol, beri jarak dari tepi agar leher dan dasar terlihat utuh.")
-    else:
-        st.session_state.pop("live_prediction", None)
-        if source == "Ambil foto":
-            incoming = st.camera_input("Ambil foto")
-        else:
-            incoming = st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png", "webp"])
-        if incoming is not None:
-            try:
-                with Image.open(BytesIO(incoming.getvalue())) as original:
-                    photo = ImageOps.exif_transpose(original).convert("RGB")
-            except (OSError, ValueError, Image.DecompressionBombError):
-                st.error("Foto tidak bisa dibaca. Coba file JPG, PNG, atau WebP yang bisa dibuka.")
-            else:
-                preview = photo.copy()
-                preview.thumbnail((640, 340))
-                st.image(preview, caption=incoming.name)
 
-with result_column, st.container(key="result_panel"):
-    st.subheader("Hasil prediksi")
-    if not model_ready:
-        st.error(f"Model ONNX untuk {selected_model} belum tersedia.")
-    elif online_camera:
-        current = live.snapshot()
-        if current is None:
-            st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
-        else:
-            render_prediction(live.labels, *current, preset=preset)
-    elif camera is not None:
-        if camera.state.playing:
-            render_live(live, preset)
-        elif camera.state.signalling:
-            st.info("Menghubungkan kamera.")
-        else:
-            st.info("Tekan Start dan izinkan akses kamera untuk melihat prediksi.")
-    elif photo is None:
-        st.info("Hasil muncul setelah foto siap.")
-    else:
-        model, config, labels = model_session(model_path, model_path.stat().st_mtime_ns)
-        reviewed = st.toggle("Cek ulang foto sulit", help="Coba empat orientasi dengan foto sedikit lebih terang.")
-        start = perf_counter()
-        scores, fuzzy = predict(photo, model, config)
-        if reviewed:
-            first = int(scores.argmax())
-            st.caption(f"Prediksi awal · {NAMA[labels[first]]} {scores[first]:.1%}")
-            scores, fuzzy = review_photo(photo, model, config)
-        render_prediction(labels, scores, fuzzy, (perf_counter() - start) * 1000, preset=preset, reviewed=reviewed)
+            saved = st.session_state.get("photo_prediction")
+            if saved is None or saved[0] != prediction_key:
+                st.info("Tekan Jalankan prediksi untuk melihat hasil foto dan pengaturan ini.")
+            else:
+                _, labels, scores, fuzzy, elapsed, first = saved
+                if first is not None:
+                    st.caption(f"Prediksi awal · {NAMA[first[0]]} {first[1]:.1%}")
+                render_prediction(labels, scores, fuzzy, elapsed, preset=preset, reviewed=reviewed)
+
+
+def render_description_page():
+    st.session_state.pop("live_prediction", None)
+    render_description(MODEL_CHOICES, NAMA)
+
+
+st.navigation([
+    st.Page(render_prediction_page, title="Prediksi", default=True),
+    st.Page(render_description_page, title="Deskripsi model", url_path="deskripsi-model"),
+], position="top").run()

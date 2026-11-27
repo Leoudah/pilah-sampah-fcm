@@ -7,6 +7,11 @@ Demo klasifikasi sampah dengan tiga model ONNX yang bisa dipilih di aplikasi.
 
 Untuk Streamlit Community Cloud, pilih `streamlit_app.py` sebagai entrypoint. Ketiga artefak tersedia di `artifacts/lightweight_fcm/`.
 
+## Navigasi aplikasi
+
+- **Prediksi** menerima unggahan, foto kamera, atau kamera realtime. Untuk foto diam, tekan **Jalankan prediksi** setelah pratinjau muncul.
+- **Deskripsi model** menjelaskan alur tiap model dan menyediakan metrik, confusion matrix, tabel per kelas, serta visualisasi FCM. Angka evaluasi di `artifacts/model_description/evaluation.json` dihitung dengan menjalankan ketiga ONNX. Dua model KNN diuji pada 1.200 foto uji Zlatan v5 yang sama. MLP diuji pada 1.637 foto data gabungan V2 tanpa TACO.
+
 | Pilihan di web | Artefak | Panel FCM |
 | --- | --- | --- |
 | FCM + KNN tanpa LDA | `mobilenet_fcm_knn_1a.onnx` | Enam keanggotaan klaster di ruang PCA 50 |
